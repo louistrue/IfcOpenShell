@@ -1,20 +1,53 @@
 # IfcPatch - IFC patching utility
-# AssignConstituentFractions Recipe
-# This recipe assigns fractions to material constituents in an IFC file based on their widths.
+# Copyright (C) 2024 Louis Trümpler <louis@lt.plus>
+#
+# This file is part of IfcPatch.
+#
+# IfcPatch is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# IfcPatch is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with IfcPatch.  If not, see <http://www.gnu.org/licenses/>.
 
 import ifcopenshell
+import ifcopenshell.util.element
 from ifcopenshell.util.unit import calculate_unit_scale
 from logging import Logger
 from collections import defaultdict
-from typing import List
-
+from typing import List, Dict, Tuple, Optional
 
 class Patcher:
     """
-    Assigns fractions to material constituents in an IFC file based on their widths.
-
-    This patcher calculates the widths of material constituents based on associated quantities
-    and assigns fraction values accordingly.
+    Assigns fractions to material constituents based on their "width".
+    
+    In Reference View MVD, material layer information is exchanged through 
+    IfcMaterialConstituentSet and IfcPhysicalComplexQuantity instead of IfcMaterialLayerSet. 
+    The layer thicknesses are stored as IfcQuantityLength within IfcPhysicalComplexQuantity 
+    with a Discrimination of 'layer'.
+    
+    While the Fraction attribute in IfcMaterialConstituent is optional, it's valuable for 
+    downstream applications as it indicates the relative proportion of each constituent in 
+    the total material composition in a more straightforward way. 
+    However, authoring applications often export material constituents without setting this attribute.
+    
+    This patcher helps maintain proper material information in Reference View exports by:
+    1. Finding width quantities from IfcPhysicalComplexQuantity with 'layer' discrimination
+    2. Using these widths to calculate relative proportions
+    3. Setting the optional but valuable Fraction attribute
+    
+    For example, if a wall has constituents with widths of 0.1m and 0.2m, their fractions 
+    would be set to 0.333 and 0.667 respectively.
+    
+    References:
+    - IFC4 Reference View MVD: https://standards.buildingsmart.org/MVD/RELEASE/IFC4/ADD2_TC1/RV1_2/HTML/
+    - IfcMaterialConstituent: https://standards.buildingsmart.org/IFC/RELEASE/IFC4/ADD2_TC1/HTML/schema/ifcmaterialresource/lexical/ifcmaterialconstituent.htm
     """
 
     def __init__(self, src: str, file: ifcopenshell.file, logger: Logger, *args):
@@ -23,137 +56,96 @@ class Patcher:
         self.logger = logger
 
     def patch(self):
-        """
-        Execute the patch to assign fractions to material constituents.
-        """
-        unit_scale_to_mm = calculate_unit_scale(self.file) * 1000.0
+        """Execute the patch to assign fractions to material constituents."""
+        unit_scale = calculate_unit_scale(self.file)
+        
+        # Get length unit from file for display
+        length_unit = "model units"
+        for unit in self.file.by_type("IfcSIUnit"):
+            if unit.UnitType == "LENGTHUNIT":
+                prefix = getattr(unit, "Prefix", None)
+                length_unit = f"{prefix if prefix else ''}{unit.Name}"
+                break
 
         for constituent_set in self.file.by_type('IfcMaterialConstituentSet'):
             constituents = constituent_set.MaterialConstituents or []
             if not constituents:
                 continue  # Skip if no constituents found
 
-            # Find elements associated with this constituent set via IfcRelAssociatesMaterial
-            associated_elements = self.get_associated_elements(constituent_set)
+            # Find elements associated with this constituent set
+            associated_elements = set(ifcopenshell.util.element.get_elements_by_material(self.file, constituent_set))
             if not associated_elements:
-                continue  # Skip if no associated elements found
-
-            # Collect quantities associated with the elements
-            quantities = self.get_quantities_from_elements(associated_elements)
-
-            # Build a mapping of quantity names to quantities
-            quantity_name_map = self.build_quantity_name_map(quantities)
+                continue
 
             # Calculate widths for constituents
-            constituent_widths, total_width_mm = self.calculate_constituent_widths(
-                constituents, quantity_name_map, unit_scale_to_mm
+            constituent_widths, total_width = self.calculate_constituent_widths(
+                constituents, associated_elements, unit_scale
             )
 
-            if total_width_mm == 0.0:
+            if total_width == 0.0:
                 constituent_set_name = constituent_set.Name or "Unnamed Constituent Set"
                 self.logger.warning(f"No widths found for constituents in set '{constituent_set_name}'. Skipping.")
-                continue  # Skip if total width is zero to avoid division by zero
+                continue
 
             # Assign fractions based on widths
-            for constituent, width_mm in constituent_widths.items():
-                fraction = width_mm / total_width_mm
+            for constituent, width in constituent_widths.items():
+                fraction = width / total_width
                 constituent.Fraction = fraction
-                self.logger.info(f"Constituent: {constituent.Name}, Width: {width_mm:.2f} mm, Fraction: {fraction:.4f}")
+                self.logger.info(
+                    f"Constituent: {constituent.Name}, "
+                    f"Width: {width:.4f} {length_unit}, "
+                    f"Fraction: {fraction:.4f}"
+                )
 
-    def get_associated_elements(self, constituent_set) -> List[ifcopenshell.entity_instance]:
-        """
-        Retrieve elements associated with a given material constituent set.
-
-        :param constituent_set: The material constituent set.
-        :return: A list of associated elements.
-        """
-        associated_elements = []
-        for rel in self.file.get_inverse(constituent_set):
-            if rel.is_a('IfcRelAssociatesMaterial') and rel.RelatedObjects:
-                associated_elements.extend(rel.RelatedObjects)
-        return associated_elements
-
-    def get_element_quantities(self, element) -> List[ifcopenshell.entity_instance]:
-        """
-        Retrieve quantities associated with an element.
-
-        :param element: The IFC element.
-        :return: A list of quantities.
-        """
-        quantities = []
+    def get_element_quantities(self, element: ifcopenshell.entity_instance) -> Dict[str, float]:
+        """Get width quantities for an element."""
+        quantities = {}
+        
+        # Get quantities from IfcPhysicalComplexQuantity
         for rel in getattr(element, 'IsDefinedBy', []):
-            if rel.is_a('IfcRelDefinesByProperties'):
-                prop_def = rel.RelatingPropertyDefinition
-                if prop_def.is_a('IfcElementQuantity'):
-                    quantities.extend(prop_def.Quantities)
+            if not rel.is_a('IfcRelDefinesByProperties'):
+                continue
+            definition = rel.RelatingPropertyDefinition
+            if not definition.is_a('IfcElementQuantity'):
+                continue
+            for quantity in definition.Quantities:
+                if not quantity.is_a('IfcPhysicalComplexQuantity'):
+                    continue
+                if quantity.Discrimination.lower() != 'layer':
+                    continue
+                for sub_quantity in quantity.HasQuantities:
+                    if not sub_quantity.is_a('IfcQuantityLength'):
+                        continue
+                    if sub_quantity.Name.lower() != 'width':
+                        continue
+                    quantities[quantity.Name.lower()] = float(sub_quantity.LengthValue)
+                
         return quantities
 
-    def get_quantities_from_elements(self, elements) -> List[ifcopenshell.entity_instance]:
-        """
-        Collect quantities from a list of elements.
-
-        :param elements: A list of IFC elements.
-        :return: A list of quantities.
-        """
-        quantities = []
-        for element in elements:
-            quantities.extend(self.get_element_quantities(element))
-        return quantities
-
-    def build_quantity_name_map(self, quantities) -> defaultdict:
-        """
-        Build a mapping from quantity names to quantities.
-
-        :param quantities: A list of quantities.
-        :return: A defaultdict mapping names to quantities.
-        """
-        quantity_name_map = defaultdict(list)
-        for q in quantities:
-            if q.is_a('IfcPhysicalComplexQuantity'):
-                q_name = (q.Name or '').strip().lower()
-                quantity_name_map[q_name].append(q)
-        return quantity_name_map
-
-    def extract_width_from_quantity(self, quantity, unit_scale_to_mm: float) -> float:
-        """
-        Extract the width from a quantity.
-
-        :param quantity: The complex quantity.
-        :param unit_scale_to_mm: The unit scale to millimeters.
-        :return: The width in millimeters.
-        """
-        for sub_q in getattr(quantity, 'HasQuantities', []):
-            if sub_q.is_a('IfcQuantityLength') and (sub_q.Name or '').strip().lower() == 'width':
-                raw_length_value = sub_q.LengthValue or 0.0
-                width_mm = raw_length_value * unit_scale_to_mm
-                return width_mm
-        return 0.0
-
-    def calculate_constituent_widths(self, constituents, quantity_name_map, unit_scale_to_mm: float):
-        """
-        Calculate the widths of constituents based on associated quantities.
-
-        :param constituents: A list of material constituents.
-        :param quantity_name_map: A mapping from quantity names to quantities.
-        :param unit_scale_to_mm: The unit scale to millimeters.
-        :return: A tuple containing the constituent widths and total width.
-        """
+    def calculate_constituent_widths(
+        self,
+        constituents: List[ifcopenshell.entity_instance],
+        elements: set[ifcopenshell.entity_instance],
+        unit_scale: float
+    ) -> Tuple[Dict[ifcopenshell.entity_instance, float], float]:
+        """Calculate the widths of constituents based on associated quantities."""
         constituents_by_name = defaultdict(list)
         for constituent in constituents:
             constituent_name = (constituent.Name or "Unnamed Constituent").strip().lower()
             constituents_by_name[constituent_name].append(constituent)
 
+        # Collect all quantities from all elements
+        element_quantities = {}
+        for element in elements:
+            element_quantities.update(self.get_element_quantities(element))
+
         constituent_widths = {}
-        total_width_mm = 0.0
+        total_width = 0.0
 
         for constituent_name, constituents_list in constituents_by_name.items():
-            quantities_list = quantity_name_map.get(constituent_name, [])
-            for i, constituent in enumerate(constituents_list):
-                width_mm = 0.0
-                if i < len(quantities_list):
-                    matched_quantity = quantities_list[i]
-                    width_mm = self.extract_width_from_quantity(matched_quantity, unit_scale_to_mm)
-                constituent_widths[constituent] = width_mm
-                total_width_mm += width_mm
+            width = element_quantities.get(constituent_name, 0.0)
+            for constituent in constituents_list:
+                constituent_widths[constituent] = width
+                total_width += width
 
-        return constituent_widths, total_width_mm
+        return constituent_widths, total_width
